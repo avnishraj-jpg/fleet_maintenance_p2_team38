@@ -19,4 +19,6 @@ This document tracks the individual contributions of all team members.
 - To be updated.
 
 ### Saransh Kumar Gupta (2024508)
-- To be updated.
+- Implemented fit_constant_budget() to calculate a baseline repair budget using the 90.91th percentile of training repair costs, treating missing repair costs as zero.
+- Implemented predict_budgets() to assign the baseline budget to inspected vehicles and zero budget to uninspected vehicles.
+- Added input validation to handle invalid repair costs, inspection flags, and budget values.
