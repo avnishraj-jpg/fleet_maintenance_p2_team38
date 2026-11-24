@@ -3,7 +3,7 @@ import pandas as pd
 
 
 def fit_constant_budget(train: pd.DataFrame) -> float:
-    costs = train["repair_cost"].fillna(0).to_numpy(dtype=float)
+    costs = train["repair_cost"].dropna().to_numpy(dtype=float)
 
     if len(costs) == 0 or not np.isfinite(costs).all() or (costs < 0).any():
         raise ValueError("Invalid repair costs.")
