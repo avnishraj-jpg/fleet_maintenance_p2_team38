@@ -25,4 +25,5 @@ The objective of this project is to develop machine learning models for fleet ma
 - `CONTRIBUTIONS.md` – Individual contribution records.
 - `SUBMISSIONS.md` – Kaggle submission history.
 
+
 *Project methodology, model details and evaluation results will be added as the project progresses.*
