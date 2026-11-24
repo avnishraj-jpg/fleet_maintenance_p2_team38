@@ -221,3 +221,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Competition data (never upload to GitHub)
+data/*
+!data/.gitkeep
+
+# Generated submission files
+submissions/*.csv
