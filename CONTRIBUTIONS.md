@@ -13,7 +13,13 @@ This document tracks the individual contributions of all team members.
     - Train and test sensor distribution comparison.
 
 ### Mohd Farhan Ali (2024352)
-- To be updated.
+- Implemented src/preprocessing.py for cleaning sensor features before modelling.
+- Removed the constant sensor s146 and restricted features to sensor columns (s000-s169), excluding targets and followup_days.
+- Implemented fit_preprocessor() with median (baseline), mean, constant and KNN imputation options.
+- Added optional missingness indicators (for the highly missing sensors or all sensors) and an option to drop sensors with more than 50% missing values.
+- Added optional standard scaling for Logistic Regression and distance-based models.
+- Implemented transform_features() and preprocess_data() so all transformations are fitted on training data only and applied unchanged to validation and test data, preventing data leakage.
+- Defined a set of preprocessing configurations for validation comparison.
 
 ### Shaik Mohd Aatiq (2024518)
 - To be updated.
