@@ -31,12 +31,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin, clone
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.pipeline import Pipeline
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cost_model import fit_constant_budget  # noqa: E402
+from cost_model import fit_constant_budget, predict_budgets  # noqa: E402
 from cv_utils import (  # noqa: E402
     get_prediction_probabilities,
     load_folds,
@@ -540,6 +540,48 @@ TUNED_LGBM_PARAMS = dict(
 #   versus 75,837 / 78,083 for the default and 72,985 / 79,997 for trial 10).
 
 
+FINAL_SEEDS = (42, 7, 123, 2024, 99)
+
+
+class SeedAveragedLGBM(BaseEstimator, ClassifierMixin):
+    """Average the probabilities of LightGBM models trained with different seeds.
+
+    A single model's OOF cost moves by about +/-3k with the random seed;
+    averaging several seeds reduces that variance at no risk of leakage
+    (every member is fitted on the same training data).
+    """
+
+    def __init__(self, params=None, seeds=FINAL_SEEDS):
+        self.params = params
+        self.seeds = seeds
+
+    def fit(self, X, y):
+        self.models_ = [build_lgbm(**{**(self.params or {}), "random_state": s}).fit(X, y) for s in self.seeds]
+        self.classes_ = self.models_[0].classes_
+        return self
+
+    def predict_proba(self, X):
+        return np.mean([m.predict_proba(X) for m in self.models_], axis=0)
+
+
+def build_final_lgbm() -> Pipeline:
+    """Final model: tuned LightGBM averaged over FINAL_SEEDS."""
+    return Pipeline([("model", SeedAveragedLGBM(params=TUNED_LGBM_PARAMS, seeds=FINAL_SEEDS))])
+
+
+def make_submission(test_df: pd.DataFrame, probabilities, threshold: float, budget: float) -> pd.DataFrame:
+    """Kaggle submission (id, flag, budget) with the same checks as V1."""
+    flags = (np.asarray(probabilities) >= threshold).astype(int)
+    submission = pd.DataFrame({"id": test_df["id"].to_numpy(), "flag": flags,
+                               "budget": predict_budgets(flags, budget)})
+    assert len(submission) == len(test_df)
+    assert submission["id"].is_unique
+    assert submission["flag"].isin([0, 1]).all()
+    assert (submission["budget"] >= 0).all()
+    assert submission.notna().all().all()
+    return submission
+
+
 def seed_stability(configs: dict, X, y, folds, train_df, seeds=(7, 123, 2024)) -> pd.DataFrame:
     """OOF cost of each configuration under several random seeds.
 
@@ -620,6 +662,70 @@ def run_seed_check():
     print("\nMean:", table.mean().round(0).to_dict(), "| std:", table.std().round(0).to_dict())
 
 
+SUBMISSIONS_DIR = Path(__file__).resolve().parent.parent / "submissions"
+
+
+def run_final():
+    """Final model: CV of the seed-averaged tuned LightGBM, test predictions, submissions."""
+    train_df, test_df, X, y, folds = _load()
+    features = list(X.columns)
+    test_aligned = align_test_sensors(test_df, train_df)
+    budget = fit_constant_budget(train_df)
+
+    # 1. CV: thresholds come from the same kind of model that predicts test
+    models = {"LGBM tuned, 5-seed average": build_final_lgbm(), "LR benchmark (1:50)": build_lr_benchmark()}
+    evals = {}
+    for name, model in models.items():
+        evals[name] = evaluate_cost(run_cv(model, X, y, folds, name=name), train_df, folds)
+    with pd.option_context("display.float_format", lambda v: f"{v:,.4f}", "display.width", 200):
+        print("\nCV results:")
+        print(comparison_table(list(evals.values())).T.to_string())
+
+    # 2. Fit on all training data and predict test
+    lgbm = build_final_lgbm().fit(X, y)
+    lr = build_lr_benchmark().fit(X, y)
+    p = {
+        "lgbm_aligned": lgbm.predict_proba(test_aligned[features])[:, 1],
+        "lgbm_raw": lgbm.predict_proba(test_df[features])[:, 1],
+        "lr_aligned": lr.predict_proba(test_aligned[features])[:, 1],
+        "lr_raw": lr.predict_proba(test_df[features])[:, 1],
+    }
+    thr = {"lgbm": evals["LGBM tuned, 5-seed average"]["summary"]["threshold"],
+           "lr": evals["LR benchmark (1:50)"]["summary"]["threshold"]}
+    cv_rate = {k: evals[n]["summary"]["flagged"] / len(X) for k, n in
+               [("lgbm", "LGBM tuned, 5-seed average"), ("lr", "LR benchmark (1:50)")]}
+
+    # 3. Diagnostics: inspection rate on test vs CV, raw vs aligned test
+    rows = []
+    for key, probs in p.items():
+        model = key.split("_")[0]
+        flags = probs >= thr[model]
+        rows.append({"predictions": key, "threshold": thr[model], "flagged": int(flags.sum()),
+                     "test_flag_rate": flags.mean(), "cv_flag_rate": cv_rate[model],
+                     "mean_probability": probs.mean()})
+    diag = pd.DataFrame(rows).set_index("predictions")
+    fa, fr = p["lgbm_aligned"] >= thr["lgbm"], p["lgbm_raw"] >= thr["lgbm"]
+    agreement = pd.Series({
+        "Spearman(aligned, raw) probabilities": pd.Series(p["lgbm_aligned"]).corr(pd.Series(p["lgbm_raw"]), "spearman"),
+        "flagged in both": int((fa & fr).sum()),
+        "flagged only with aligned test": int((fa & ~fr).sum()),
+        "flagged only with raw test": int((~fa & fr).sum()),
+    })
+    with pd.option_context("display.float_format", lambda v: f"{v:,.4f}", "display.width", 200):
+        print(f"\nBudget for inspected vehicles: {budget:,.2f}")
+        print("\nTest predictions vs CV:")
+        print(diag.to_string())
+        print("\nLightGBM, aligned vs raw test:")
+        print(agreement.to_string())
+
+    # 4. Submissions (submissions/ is ignored by git)
+    SUBMISSIONS_DIR.mkdir(exist_ok=True)
+    for key, model in [("lgbm_aligned", "lgbm"), ("lgbm_raw", "lgbm"), ("lr_aligned", "lr")]:
+        path = SUBMISSIONS_DIR / f"v2_{key}.csv"
+        make_submission(test_df, p[key], thr[model], budget).to_csv(path, index=False)
+        print(f"Saved {path.name}")
+
+
 def main():
     train_df, test_df, X, y, folds = _load()
     print(f"Cost of inspecting nobody: {no_inspection_cost(train_df):,.2f}\n")
@@ -654,6 +760,7 @@ def main():
 
 
 if __name__ == "__main__":
-    # python src/lightgbm_model.py [compare|importance|tune|seeds]
+    # python src/lightgbm_model.py [compare|importance|tune|seeds|final]
     step = sys.argv[1] if len(sys.argv) > 1 else "compare"
-    {"compare": main, "importance": run_importance, "tune": run_tuning, "seeds": run_seed_check}[step]()
+    {"compare": main, "importance": run_importance, "tune": run_tuning, "seeds": run_seed_check,
+     "final": run_final}[step]()
