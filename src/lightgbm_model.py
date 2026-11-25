@@ -47,6 +47,8 @@ from evaluation import evaluate_predictions, select_threshold  # noqa: E402
 from failure_model import CHOSEN_CONFIG, build_model  # noqa: E402
 from feature_analysis import (  # noqa: E402
     align_test_sensors,
+    find_correlated_groups,
+    find_low_variance_features,
     find_unavailable_in_test,
     load_data,
 )
@@ -135,6 +137,89 @@ def build_lgbm(**overrides):
 def build_lgbm_all_features(**overrides) -> Pipeline:
     """Task 6: LightGBM on all base features, no preprocessing needed."""
     return Pipeline([("model", build_lgbm(**overrides))])
+
+
+# --------------------------------------------------
+# Fold-wise feature selection (task 7)
+# --------------------------------------------------
+
+class FoldFeatureSelector(BaseEstimator, TransformerMixin):
+    """Feature selection fitted on the training fold only.
+
+    Inside a Pipeline that run_cv clones per fold, `fit` only ever sees the
+    training part of a fold, so the validation fold never influences which
+    features are kept. Steps, in order:
+
+    1. Low-variance filter (unsupervised): drop constant and quasi-constant
+       sensors (one value in >= 99% of observed rows).
+    2. Correlation filter (unsupervised): within each group of sensors with
+       |Spearman rho| > corr_threshold keep one (the one with the fewest
+       missing values).
+    3. Importance ranking (supervised): fit a LightGBM model on the remaining
+       sensors and keep the top_k by total gain.
+
+    Set corr_threshold=None or top_k=None to skip a step.
+    """
+
+    def __init__(self, drop_low_variance=True, corr_threshold=0.95, top_k=None, ranking_params=None):
+        self.drop_low_variance = drop_low_variance
+        self.corr_threshold = corr_threshold
+        self.top_k = top_k
+        self.ranking_params = ranking_params
+
+    def fit(self, X, y):
+        cols = list(X.columns)
+        self.dropped_ = {}
+
+        if self.drop_low_variance:
+            lv = find_low_variance_features(X[cols])
+            self.dropped_["low_variance"] = lv["constant"] + lv["quasi_constant"]
+            cols = [c for c in cols if c not in self.dropped_["low_variance"]]
+
+        if self.corr_threshold is not None:
+            _, to_drop = find_correlated_groups(X[cols], threshold=self.corr_threshold)
+            self.dropped_["correlated"] = to_drop
+            cols = [c for c in cols if c not in to_drop]
+
+        if self.top_k is not None and self.top_k < len(cols):
+            params = {"n_estimators": 300, "learning_rate": 0.05, **(self.ranking_params or {})}
+            ranker = build_lgbm(**params).fit(X[cols], y)
+            gain = pd.Series(ranker.booster_.feature_importance("gain"), index=cols)
+            keep = gain.sort_values(ascending=False).index[: self.top_k]
+            self.dropped_["low_importance"] = [c for c in cols if c not in keep]
+            cols = [c for c in cols if c in keep]
+
+        self.selected_features_ = cols
+        return self
+
+    def transform(self, X):
+        return X[self.selected_features_]
+
+
+def build_lgbm_selected(top_k=None, corr_threshold=0.95, **overrides) -> Pipeline:
+    """Task 7: fold-wise feature selection followed by LightGBM."""
+    return Pipeline([
+        ("select", FoldFeatureSelector(corr_threshold=corr_threshold, top_k=top_k)),
+        ("model", build_lgbm(**overrides)),
+    ])
+
+
+def selection_stability(cv_result: dict) -> dict:
+    """How consistently the fold-wise selector picked the same features."""
+    selected = [set(m.named_steps["select"].selected_features_) for m in cv_result["models"]]
+    counts = pd.Series([f for s in selected for f in s]).value_counts()
+    jaccard = [len(a & b) / len(a | b) for i, a in enumerate(selected) for b in selected[i + 1:]]
+    per_fold = pd.DataFrame([
+        {"fold": k, "n_selected": len(s),
+         **{f"dropped_{r}": len(v) for r, v in m.named_steps["select"].dropped_.items()}}
+        for k, (s, m) in enumerate(zip(selected, cv_result["models"]), start=1)
+    ]).set_index("fold")
+    return {
+        "per_fold": per_fold,
+        "times_selected": counts,
+        "in_all_folds": sorted(counts[counts == len(selected)].index),
+        "mean_pairwise_jaccard": float(np.mean(jaccard)),
+    }
 
 
 # --------------------------------------------------
@@ -280,12 +365,24 @@ def main():
     experiments = {
         "LR benchmark (1:50)": build_lr_benchmark(),
         "LGBM all features": build_lgbm_all_features(),
+        "LGBM selected: filters only": build_lgbm_selected(top_k=None),
+        "LGBM selected: top 80": build_lgbm_selected(top_k=80),
+        "LGBM selected: top 50": build_lgbm_selected(top_k=50),
+        "LGBM selected: top 30": build_lgbm_selected(top_k=30),
     }
-    evaluations = []
+    evaluations, stability = [], {}
     for name, model in experiments.items():
         cv = run_cv(model, X, y, folds, name=name)
         evaluations.append(evaluate_cost(cv, train_df, folds))
+        if "select" in cv["models"][0].named_steps:
+            stability[name] = selection_stability(cv)
         print()
+
+    print("Fold-wise selection:")
+    for name, s in stability.items():
+        print(f"\n{name}: mean pairwise Jaccard {s['mean_pairwise_jaccard']:.3f}, "
+              f"{len(s['in_all_folds'])} features selected in all 5 folds")
+        print(s["per_fold"].to_string())
 
     with pd.option_context("display.float_format", lambda v: f"{v:,.4f}", "display.width", 200):
         print("Comparison (sorted by OOF cost):")
