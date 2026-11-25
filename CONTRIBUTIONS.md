@@ -22,6 +22,12 @@ This document tracks the individual contributions of all team members.
 - Added optional standard scaling for Logistic Regression and distance-based models.
 - Implemented transform_features() and preprocess_data() so all transformations are fitted on training data only and applied unchanged to validation and test data, preventing data leakage.
 - Defined a set of preprocessing configurations for validation comparison.
+- V2: finalised `src/preprocessing.py` (backward compatible): added `SensorPreprocessor`, a Pipeline step so preprocessing is refitted inside each CV fold, and an optional signed-log transform.
+- V2: implemented `src/feature_selection.py`, using the shared 5-fold CV indices with every imputer and feature selector fitted only on the training part of each fold:
+  - Compared imputation and missingness settings with the V1 Logistic Regression (median 81,465, which reproduces the team benchmark; mean, constant 0, missingness indicators and dropping highly missing sensors were all within noise or worse; signed log raised ROC-AUC but increased cost).
+  - Implemented L1 Logistic Regression and `L1FeatureSelector`, identified zero-coefficient sensors and measured selection stability across folds for several C values.
+  - Compared all features vs L1-selected features: about 23 sensors (C=0.001) keep the cost within noise of all 167 features for both Logistic Regression and tuned LightGBM, but selection does not lower the cost.
+  - Saved the selected feature list and CV comparisons in `results/`.
 
 ### Shaik Mohd Aatiq (2024518)
 
