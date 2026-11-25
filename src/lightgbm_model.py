@@ -442,6 +442,120 @@ def importance_report(builtin: pd.DataFrame, perm: pd.DataFrame, groups: list, t
     return {"combined": combined.head(top), "agreement": agreement}
 
 
+# --------------------------------------------------
+# Tuning (task 9)
+# --------------------------------------------------
+
+TUNING_SPACE = {
+    "learning_rate": (0.01, 0.1),            # log-uniform
+    "n_estimators": [300, 500, 800, 1200],
+    "num_leaves": [7, 15, 31, 63],
+    "min_child_samples": [10, 20, 40, 80, 150],
+    "subsample": [0.6, 0.8, 1.0],
+    "colsample_bytree": [0.3, 0.5, 0.7, 0.9],
+    "reg_lambda": (0.1, 20.0),               # log-uniform
+    "scale_pos_weight": [1, 3, 10, 30],
+}
+
+
+def sample_params(rng) -> dict:
+    """One random configuration from TUNING_SPACE."""
+    params = {}
+    for name, space in TUNING_SPACE.items():
+        if isinstance(space, tuple):
+            lo, hi = np.log(space[0]), np.log(space[1])
+            params[name] = float(np.round(np.exp(rng.uniform(lo, hi)), 4))
+        else:
+            params[name] = space[int(rng.integers(len(space)))]
+            params[name] = params[name].item() if hasattr(params[name], "item") else params[name]
+    return params
+
+
+def threshold_sensitivity(oof, train_df: pd.DataFrame, threshold: float) -> dict:
+    """Cost when the chosen threshold is halved or doubled (lower = more robust)."""
+    repair = train_df["repair_cost"].to_numpy()
+    budget = fit_constant_budget(train_df)
+    out = {}
+    for label, factor in [("cost_thr_x0.5", 0.5), ("cost_thr_x2", 2.0)]:
+        flags = (oof >= threshold * factor).astype(int)
+        out[label] = evaluate_predictions(train_df["failure"], oof, repair, flags,
+                                          np.where(flags == 1, budget, 0.0))["total_cost"]
+    return out
+
+
+def tune_lgbm(X: pd.DataFrame, y: pd.Series, folds, train_df: pd.DataFrame,
+              n_trials: int = 30, random_state: int = RANDOM_STATE, log=print) -> pd.DataFrame:
+    """Random search over TUNING_SPACE on the shared folds.
+
+    Trial 0 is the default configuration, so every trial can be compared with
+    it fold by fold ("folds_beating_default"). Ranked by OOF cost.
+    """
+    rng = np.random.default_rng(random_state)
+    trials = [{}] + [sample_params(rng) for _ in range(n_trials - 1)]
+    rows, default_fold_costs = [], None
+    for i, params in enumerate(trials):
+        start = time.time()
+        cv = run_cv(build_lgbm_all_features(**params), X, y, folds, name=f"trial {i}", verbose=False)
+        ev = evaluate_cost(cv, train_df, folds)
+        fold_costs = ev["per_fold"]["cost"].to_numpy()
+        if i == 0:
+            default_fold_costs = fold_costs
+        s = ev["summary"]
+        rows.append({
+            "trial": i,
+            **{k: params.get(k, DEFAULT_LGBM_PARAMS.get(k, 1)) for k in TUNING_SPACE},
+            "oof_cost": s["oof_cost"], "fold_cost_std": s["fold_cost_std"],
+            "folds_beating_default": int((fold_costs < default_fold_costs).sum()),
+            **threshold_sensitivity(cv["oof"], train_df, s["threshold"]),
+            "threshold": s["threshold"], "tp": s["tp"], "fp": s["fp"],
+            "roc_auc": s["roc_auc_mean"], "pr_auc": s["pr_auc_mean"],
+            "seconds": time.time() - start,
+        })
+        log(f"trial {i:>2}: OOF cost {s['oof_cost']:>10,.0f} | PR-AUC {s['pr_auc_mean']:.4f} | "
+            f"{rows[-1]['seconds']:.0f}s | {params or 'default'}")
+    return pd.DataFrame(rows).set_index("trial").sort_values("oof_cost")
+
+
+# Chosen after tuning (python src/lightgbm_model.py tune / seeds), see notes below.
+TUNED_LGBM_PARAMS = dict(
+    learning_rate=0.0945,
+    n_estimators=800,
+    num_leaves=63,
+    min_child_samples=80,
+    subsample=1.0,
+    colsample_bytree=0.7,
+    reg_lambda=1.0873,
+    scale_pos_weight=1,
+)
+# Tuning notes (30-trial random search on the shared folds, seed 42):
+# - Best OOF cost: trial 10 (70,305), trial 28 (70,347), trial 2 (71,331);
+#   default (trial 0) 73,828. The top 10 trials lie within 70.3k-72.1k.
+# - Re-running with seeds 7 / 123 / 2024 shows that seed noise is about
+#   +/-3k: default averages 70,251, trial 2 69,752, trial 10 70,286. The
+#   default's 73,828 at seed 42 was an unlucky seed, so most of the apparent
+#   tuning gain was noise.
+# - Trial 2 is chosen: lowest seed-averaged cost, beats the default on 4 of 5
+#   folds, low fold-cost std (2,644), and it is the most robust to the
+#   threshold (cost 75,251 / 72,629 when the threshold is halved / doubled,
+#   versus 75,837 / 78,083 for the default and 72,985 / 79,997 for trial 10).
+
+
+def seed_stability(configs: dict, X, y, folds, train_df, seeds=(7, 123, 2024)) -> pd.DataFrame:
+    """OOF cost of each configuration under several random seeds.
+
+    Differences between configurations smaller than the spread across seeds
+    are not meaningful.
+    """
+    rows = []
+    for seed in seeds:
+        for name, params in configs.items():
+            cv = run_cv(build_lgbm_all_features(**{**params, "random_state": seed}), X, y, folds,
+                        name=name, verbose=False)
+            s = evaluate_cost(cv, train_df, folds)["summary"]
+            rows.append({"seed": seed, "config": name, "oof_cost": s["oof_cost"], "pr_auc": s["pr_auc_mean"]})
+    return pd.DataFrame(rows).pivot(index="seed", columns="config", values="oof_cost")
+
+
 def per_fold_costs(evaluations: list) -> pd.DataFrame:
     """Fold-by-fold cost for each model (same folds, so directly comparable)."""
     return pd.DataFrame({e["summary"]["model"]: e["per_fold"].set_index("fold")["cost"] for e in evaluations})
@@ -487,6 +601,25 @@ def run_importance():
             print(f"  {len(g):>2} sensors: {', '.join(g)}")
 
 
+def run_tuning(n_trials: int = 30):
+    """Task 9: random search for LightGBM on the shared folds."""
+    train_df, _, X, y, folds = _load()
+    results = tune_lgbm(X, y, folds, train_df, n_trials=n_trials, log=lambda m: print(m, flush=True))
+    with pd.option_context("display.float_format", lambda v: f"{v:,.4f}", "display.width", 250):
+        print("\nTop 10 trials (sorted by OOF cost):")
+        print(results.head(10).to_string())
+        print("\nDefault configuration (trial 0):")
+        print(results.loc[[0]].to_string())
+
+
+def run_seed_check():
+    """Default vs tuned configuration across random seeds."""
+    train_df, _, X, y, folds = _load()
+    table = seed_stability({"default": {}, "tuned": TUNED_LGBM_PARAMS}, X, y, folds, train_df)
+    print(table.round(0).to_string())
+    print("\nMean:", table.mean().round(0).to_dict(), "| std:", table.std().round(0).to_dict())
+
+
 def main():
     train_df, test_df, X, y, folds = _load()
     print(f"Cost of inspecting nobody: {no_inspection_cost(train_df):,.2f}\n")
@@ -521,6 +654,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # python src/lightgbm_model.py [compare|importance]
+    # python src/lightgbm_model.py [compare|importance|tune|seeds]
     step = sys.argv[1] if len(sys.argv) > 1 else "compare"
-    {"compare": main, "importance": run_importance}[step]()
+    {"compare": main, "importance": run_importance, "tune": run_tuning, "seeds": run_seed_check}[step]()
