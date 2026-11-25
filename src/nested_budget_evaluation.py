@@ -20,13 +20,12 @@ from lightgbm import LGBMRegressor
 
 from src.cv_utils import PROJECT_ROOT, RESULTS_DIR, load_folds
 from src.cost_model import fit_constant_budget
-from src.evaluation import calculate_cost
+from src.evaluation import calculate_cost, tune_policy
 from src.preprocessing import fit_preprocessor, transform_features
 from src.feature_analysis import load_data
 from src.lightgbm_model import build_final_lgbm, get_base_features
 
 
-MULTIPLIERS = [0.5, 0.75, 1.0, 1.25, 1.5]
 INNER_SPLITS = 4
 RANDOM_STATE = 42
 
@@ -108,76 +107,6 @@ def predict_failure_probabilities(X_train, y_train, X_valid):
     model.fit(X_train, y_train)
 
     return model.predict_proba(X_valid)[:, 1]
-
-
-def tune_policy(probabilities, actual_costs, predicted_budgets):
-    """Select threshold and budget multiplier using inner OOF predictions."""
-
-    p = np.asarray(probabilities, dtype=float)
-    actual = np.nan_to_num(
-        np.asarray(actual_costs, dtype=float),
-        nan=0.0,
-    )
-    budgets = np.maximum(
-        np.asarray(predicted_budgets, dtype=float),
-        0.0,
-    )
-
-    if not (
-        len(p) == len(actual) == len(budgets)
-    ):
-        raise ValueError("Policy inputs have different lengths.")
-
-    best = {
-        "cost": np.inf,
-        "threshold": None,
-        "multiplier": None,
-    }
-
-    order = np.argsort(-p, kind="stable")
-    sorted_p = p[order]
-
-    # Last index of each group of equal probabilities.
-    group_ends = np.r_[
-        np.flatnonzero(np.diff(sorted_p) != 0),
-        len(sorted_p) - 1,
-    ]
-
-    for multiplier in MULTIPLIERS:
-
-        scaled_budgets = budgets * multiplier
-
-        inspected_cost = (
-            10.0
-            + 0.20 * np.maximum(actual - scaled_budgets, 0.0)
-            + 0.02 * np.maximum(scaled_budgets - actual, 0.0)
-        )
-
-        delta = inspected_cost - actual
-        cumulative_delta = np.cumsum(delta[order])
-
-        candidate_costs = actual.sum() + cumulative_delta[group_ends]
-
-        # Include the option of inspecting nobody.
-        no_inspection_cost = actual.sum()
-
-        candidate_idx = int(np.argmin(candidate_costs))
-
-        if candidate_costs[candidate_idx] < no_inspection_cost:
-            threshold = float(sorted_p[group_ends[candidate_idx]])
-            cost = float(candidate_costs[candidate_idx])
-        else:
-            threshold = float(np.nextafter(p.max(), np.inf))
-            cost = float(no_inspection_cost)
-
-        if cost < best["cost"]:
-            best = {
-                "cost": cost,
-                "threshold": threshold,
-                "multiplier": multiplier,
-            }
-
-    return best
 
 
 def run_nested_evaluation():

@@ -231,3 +231,108 @@ def evaluate_predictions(
         "tp": int(tp),
     }
     return result
+
+
+# ------------------------------------------------------------------
+# Vehicle-specific budget policy selection
+# ------------------------------------------------------------------
+
+DEFAULT_BUDGET_MULTIPLIERS = (0.5, 0.75, 1.0, 1.25, 1.5)
+
+
+def tune_policy(
+    probabilities,
+    actual_costs,
+    predicted_budgets,
+    multipliers=DEFAULT_BUDGET_MULTIPLIERS,
+):
+    """Select the inspection threshold and budget multiplier.
+
+    Uses predicted failure probabilities and repair budgets to minimise
+    the official competition cost on labelled validation/OOF data.
+
+    Returns
+    -------
+    dict
+        Selected cost, probability threshold and budget multiplier.
+    """
+
+    p = np.asarray(probabilities, dtype=float)
+    actual = np.nan_to_num(
+        np.asarray(actual_costs, dtype=float),
+        nan=0.0,
+    )
+    budgets = np.maximum(
+        np.asarray(predicted_budgets, dtype=float),
+        0.0,
+    )
+
+    if not (len(p) == len(actual) == len(budgets)):
+        raise ValueError("Policy inputs have different lengths.")
+
+    if len(p) == 0:
+        raise ValueError("Policy inputs must not be empty.")
+
+    if not (
+        np.isfinite(p).all()
+        and np.isfinite(actual).all()
+        and np.isfinite(budgets).all()
+    ):
+        raise ValueError("Policy inputs must be finite.")
+
+    if ((p < 0) | (p > 1)).any():
+        raise ValueError("Probabilities must lie between 0 and 1.")
+
+    if (actual < 0).any() or (budgets < 0).any():
+        raise ValueError("Costs and budgets must be non-negative.")
+
+    if not multipliers:
+        raise ValueError("At least one budget multiplier is required.")
+
+    best = {
+        "cost": np.inf,
+        "threshold": None,
+        "multiplier": None,
+    }
+
+    order = np.argsort(-p, kind="stable")
+    sorted_p = p[order]
+
+    group_ends = np.r_[
+        np.flatnonzero(np.diff(sorted_p) != 0),
+        len(sorted_p) - 1,
+    ]
+
+    for multiplier in multipliers:
+
+        scaled_budgets = budgets * multiplier
+
+        inspected_cost = (
+            10.0
+            + 0.20 * np.maximum(actual - scaled_budgets, 0.0)
+            + 0.02 * np.maximum(scaled_budgets - actual, 0.0)
+        )
+
+        delta = inspected_cost - actual
+        cumulative_delta = np.cumsum(delta[order])
+
+        candidate_costs = actual.sum() + cumulative_delta[group_ends]
+
+        no_inspection_cost = actual.sum()
+        candidate_idx = int(np.argmin(candidate_costs))
+
+        if candidate_costs[candidate_idx] < no_inspection_cost:
+            threshold = float(sorted_p[group_ends[candidate_idx]])
+            cost = float(candidate_costs[candidate_idx])
+        else:
+            threshold = float(np.nextafter(p.max(), np.inf))
+            cost = float(no_inspection_cost)
+
+        if cost < best["cost"]:
+            best = {
+                "cost": cost,
+                "threshold": threshold,
+                "multiplier": multiplier,
+            }
+
+    return best

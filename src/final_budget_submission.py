@@ -20,7 +20,7 @@ from src.lightgbm_model import (
     get_base_features,
     run_cv,
 )
-from src.nested_budget_evaluation import tune_policy
+from src.evaluation import tune_policy
 from src.preprocessing import fit_preprocessor, transform_features
 
 
