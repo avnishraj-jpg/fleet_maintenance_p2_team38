@@ -1,4 +1,3 @@
-
 """
 cv_utils.py
 
@@ -32,18 +31,13 @@ from sklearn.metrics import (
     f1_score,
 )
 
-
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
-
-RANDOM_STATE = 42
-N_SPLITS = 5
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RESULTS_DIR = PROJECT_ROOT / "results"
-
-FOLDS_PATH = RESULTS_DIR / "cv_folds.npz"
+from src.config import (
+    PROJECT_ROOT,
+    RESULTS_DIR,
+    FOLDS_PATH,
+    RANDOM_STATE,
+    N_SPLITS,
+)
 
 
 # --------------------------------------------------

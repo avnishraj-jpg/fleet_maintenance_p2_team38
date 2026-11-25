@@ -35,26 +35,24 @@ from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin, clone
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.pipeline import Pipeline
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cost_model import fit_constant_budget, predict_budgets  # noqa: E402
-from cv_utils import (  # noqa: E402
+from src.config import RANDOM_STATE, TUNED_LGBM_PARAMS, FINAL_SEEDS
+from src.cost_model import fit_constant_budget, predict_budgets
+from src.cv_utils import (
     get_prediction_probabilities,
     load_folds,
     prepare_training_data,
     validate_folds,
 )
-from evaluation import evaluate_predictions  # noqa: E402
-from failure_model import CHOSEN_CONFIG, build_model  # noqa: E402
-from feature_analysis import (  # noqa: E402
+from src.evaluation import evaluate_predictions
+from src.failure_model import CHOSEN_CONFIG, build_model
+from src.feature_analysis import (
     align_test_sensors,
     find_correlated_groups,
     find_low_variance_features,
     find_unavailable_in_test,
     load_data,
 )
-from preprocessing import CONSTANT_SENSORS, fit_preprocessor, transform_features  # noqa: E402
-
-RANDOM_STATE = 42
+from src.preprocessing import CONSTANT_SENSORS, fit_preprocessor, transform_features
 
 
 # --------------------------------------------------
@@ -516,17 +514,6 @@ def tune_lgbm(X: pd.DataFrame, y: pd.Series, folds, train_df: pd.DataFrame,
     return pd.DataFrame(rows).set_index("trial").sort_values("oof_cost")
 
 
-# Chosen after tuning (python src/lightgbm_model.py tune / seeds), see notes below.
-TUNED_LGBM_PARAMS = dict(
-    learning_rate=0.0945,
-    n_estimators=800,
-    num_leaves=63,
-    min_child_samples=80,
-    subsample=1.0,
-    colsample_bytree=0.7,
-    reg_lambda=1.0873,
-    scale_pos_weight=1,
-)
 # Tuning notes (30-trial random search on the shared folds, seed 42):
 # - Best OOF cost: trial 10 (70,305), trial 28 (70,347), trial 2 (71,331);
 #   default (trial 0) 73,828. The top 10 trials lie within 70.3k-72.1k.
@@ -538,9 +525,6 @@ TUNED_LGBM_PARAMS = dict(
 #   folds, low fold-cost std (2,644), and it is the most robust to the
 #   threshold (cost 75,251 / 72,629 when the threshold is halved / doubled,
 #   versus 75,837 / 78,083 for the default and 72,985 / 79,997 for trial 10).
-
-
-FINAL_SEEDS = (42, 7, 123, 2024, 99)
 
 
 class SeedAveragedLGBM(BaseEstimator, ClassifierMixin):
@@ -701,7 +685,7 @@ def cost_curve(oof, train_df: pd.DataFrame, max_flagged: int = 4000) -> pd.Serie
 def plot_cost_curves(curves: dict, title: str = "OOF cost vs number of vehicles flagged"):
     """One line per model; the minimum of each curve is marked."""
     import matplotlib.pyplot as plt
-    from feature_analysis import INK_2, SERIES, SURFACE
+    from src.feature_analysis import INK_2, SERIES, SURFACE
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
     # Lowest curve's label goes below its point, the others above, so labels never overlap
@@ -723,7 +707,7 @@ def plot_cost_curves(curves: dict, title: str = "OOF cost vs number of vehicles 
 def plot_fold_costs(fold_costs: pd.DataFrame, title: str = "Cost per fold (same shared folds)"):
     """Dot plot: one row per fold, one coloured dot per model."""
     import matplotlib.pyplot as plt
-    from feature_analysis import AXIS, SERIES, SURFACE
+    from src.feature_analysis import AXIS, SERIES, SURFACE
 
     fig, ax = plt.subplots(figsize=(8, 0.6 * len(fold_costs) + 1.5))
     ypos = np.arange(len(fold_costs))
@@ -743,7 +727,7 @@ def plot_fold_costs(fold_costs: pd.DataFrame, title: str = "Cost per fold (same 
 def plot_importance_bars(values: pd.Series, title: str, xlabel: str, top: int = 20):
     """Horizontal bars for the `top` largest values."""
     import matplotlib.pyplot as plt
-    from feature_analysis import BLUE
+    from src.feature_analysis import BLUE
 
     d = values.head(top).iloc[::-1]
     fig, ax = plt.subplots(figsize=(7.5, 0.26 * len(d) + 1.2))
@@ -757,7 +741,7 @@ def plot_importance_bars(values: pd.Series, title: str, xlabel: str, top: int = 
 def plot_tuning(trials: pd.DataFrame):
     """OOF cost of every tuning trial vs its worst cost when the threshold is halved or doubled."""
     import matplotlib.pyplot as plt
-    from feature_analysis import BLUE, INK_2, ORANGE, SURFACE
+    from src.feature_analysis import BLUE, INK_2, ORANGE, SURFACE
 
     worst = trials[["cost_thr_x0.5", "cost_thr_x2"]].max(axis=1)
     fig, ax = plt.subplots(figsize=(7.5, 4.8))
@@ -780,7 +764,7 @@ def plot_tuning(trials: pd.DataFrame):
 def plot_test_vs_cv(test_vs_cv: pd.DataFrame):
     """Share of vehicles flagged: CV vs each set of test predictions."""
     import matplotlib.pyplot as plt
-    from feature_analysis import BLUE, ORANGE
+    from src.feature_analysis import BLUE, ORANGE
 
     d = test_vs_cv
     fig, ax = plt.subplots(figsize=(7.5, 3.8))
