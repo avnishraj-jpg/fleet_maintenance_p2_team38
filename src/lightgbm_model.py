@@ -43,7 +43,7 @@ from cv_utils import (  # noqa: E402
     prepare_training_data,
     validate_folds,
 )
-from evaluation import evaluate_predictions, select_threshold  # noqa: E402
+from evaluation import evaluate_predictions  # noqa: E402
 from failure_model import CHOSEN_CONFIG, build_model  # noqa: E402
 from feature_analysis import (  # noqa: E402
     align_test_sensors,
@@ -344,6 +344,104 @@ def comparison_table(evaluations: list) -> pd.DataFrame:
     return table.sort_values("oof_cost")
 
 
+# --------------------------------------------------
+# Feature importance (task 8)
+# --------------------------------------------------
+
+def _final_estimator(model):
+    return model.steps[-1][1] if isinstance(model, Pipeline) else model
+
+
+def builtin_importance(cv_result: dict) -> pd.DataFrame:
+    """LightGBM gain and split importance, averaged over the fold models.
+
+    Gain is normalised to a share of the total within each fold before
+    averaging, so every fold counts equally.
+    """
+    gains, splits = [], []
+    for model in cv_result["models"]:
+        est = _final_estimator(model)
+        names = est.booster_.feature_name()
+        gain = pd.Series(est.booster_.feature_importance("gain"), index=names)
+        gains.append(gain / gain.sum())
+        splits.append(pd.Series(est.booster_.feature_importance("split"), index=names))
+    gains, splits = pd.concat(gains, axis=1).fillna(0), pd.concat(splits, axis=1).fillna(0)
+    table = pd.DataFrame({
+        "gain_share_mean": gains.mean(axis=1), "gain_share_std": gains.std(axis=1),
+        "split_mean": splits.mean(axis=1),
+    })
+    table["gain_rank"] = table["gain_share_mean"].rank(ascending=False, method="min").astype(int)
+    table["split_rank"] = table["split_mean"].rank(ascending=False, method="min").astype(int)
+    return table.sort_values("gain_share_mean", ascending=False)
+
+
+def _permutation_drop(model, X_val, y_val, columns, baseline, rng, n_repeats):
+    """Mean drop in PR-AUC when `columns` are shuffled together (same row order)."""
+    drops = []
+    for _ in range(n_repeats):
+        X_perm = X_val.copy()
+        perm = rng.permutation(len(X_val))
+        X_perm[columns] = X_val[columns].to_numpy()[perm]
+        drops.append(baseline - average_precision_score(y_val, get_prediction_probabilities(model, X_perm)))
+    return float(np.mean(drops))
+
+
+def permutation_importance_cv(cv_result: dict, X: pd.DataFrame, y: pd.Series, folds,
+                              groups: list | None = None, n_repeats: int = 3,
+                              random_state: int = RANDOM_STATE) -> pd.DataFrame:
+    """Permutation importance on each validation fold, averaged over folds.
+
+    Score: PR-AUC (average precision), which suits the 0.7% failure rate.
+    Importance = drop in PR-AUC when a feature (or a whole group) is shuffled.
+
+    groups=None: every feature is permuted on its own.
+    groups=list of lists: each group is permuted together (features not in a
+    group are permuted alone). Use this for correlated sensors: permuting one
+    sensor of a near-duplicate group understates its importance because the
+    others still carry the same information.
+    """
+    X = X.reset_index(drop=True)
+    y = pd.Series(y).reset_index(drop=True)
+    in_group = {c for g in (groups or []) for c in g}
+    units = {", ".join(g) if len(g) <= 4 else f"{g[0]} + {len(g) - 1} correlated": list(g) for g in (groups or [])}
+    units.update({c: [c] for c in X.columns if c not in in_group})
+
+    rng = np.random.default_rng(random_state)
+    per_fold = []
+    for model, (_, va_idx) in zip(cv_result["models"], folds):
+        X_val, y_val = X.iloc[va_idx].reset_index(drop=True), y.iloc[va_idx]
+        baseline = average_precision_score(y_val, get_prediction_probabilities(model, X_val))
+        per_fold.append(pd.Series({name: _permutation_drop(model, X_val, y_val, cols, baseline, rng, n_repeats)
+                                   for name, cols in units.items()}))
+    drops = pd.concat(per_fold, axis=1)
+    table = pd.DataFrame({
+        "pr_auc_drop_mean": drops.mean(axis=1),
+        "pr_auc_drop_std": drops.std(axis=1),
+        "n_sensors": pd.Series({name: len(cols) for name, cols in units.items()}),
+        "folds_positive": (drops > 0).sum(axis=1),
+    })
+    table["rank"] = table["pr_auc_drop_mean"].rank(ascending=False, method="min").astype(int)
+    return table.sort_values("pr_auc_drop_mean", ascending=False)
+
+
+def importance_report(builtin: pd.DataFrame, perm: pd.DataFrame, groups: list, top: int = 20) -> dict:
+    """Combine gain, split and permutation importance; measure their agreement."""
+    group_of = {c: (g[0] if len(g) <= 4 else f"{g[0]} + {len(g) - 1} correlated")
+                for g in groups for c in g}
+    combined = builtin.join(perm[["pr_auc_drop_mean", "folds_positive", "rank"]]
+                            .rename(columns={"rank": "perm_rank"}), how="left")
+    combined["correlated_group"] = [group_of.get(c, "") for c in combined.index]
+
+    both = combined.dropna(subset=["pr_auc_drop_mean"])
+    agreement = pd.Series({
+        "gain vs split (Spearman)": builtin["gain_share_mean"].corr(builtin["split_mean"], method="spearman"),
+        "gain vs permutation (Spearman)": both["gain_share_mean"].corr(both["pr_auc_drop_mean"], method="spearman"),
+        f"top-{top} overlap: gain vs permutation": len(set(builtin.index[:top]) & set(perm.index[:top])) / top,
+        "features with no positive permutation effect": int((perm["pr_auc_drop_mean"] <= 0).sum()),
+    })
+    return {"combined": combined.head(top), "agreement": agreement}
+
+
 def per_fold_costs(evaluations: list) -> pd.DataFrame:
     """Fold-by-fold cost for each model (same folds, so directly comparable)."""
     return pd.DataFrame({e["summary"]["model"]: e["per_fold"].set_index("fold")["cost"] for e in evaluations})
@@ -353,13 +451,44 @@ def per_fold_costs(evaluations: list) -> pd.DataFrame:
 # Command line
 # --------------------------------------------------
 
-def main():
+def _load():
     train_df, test_df = load_data()
     X_all, y = prepare_training_data(train_df)
     features = get_base_features(train_df, test_df)
-    X = X_all[features]
     folds = load_folds()
-    print(f"Training rows: {len(X):,} | features: {len(features)} | folds: {len(folds)}")
+    print(f"Training rows: {len(X_all):,} | features: {len(features)} | folds: {len(folds)}")
+    return train_df, test_df, X_all[features], y, folds
+
+
+def run_importance():
+    """Task 8: feature importance of the all-features LightGBM."""
+    _, _, X, y, folds = _load()
+    cv = run_cv(build_lgbm_all_features(), X, y, folds, name="LGBM all features")
+    # Unsupervised groups on the training data, used only to interpret importance
+    groups, _ = find_correlated_groups(X, threshold=0.95)
+
+    builtin = builtin_importance(cv)
+    print("\nPermutation importance (single sensors) ...")
+    perm_single = permutation_importance_cv(cv, X, y, folds)
+    print("Permutation importance (correlated groups shuffled together) ...")
+    perm_grouped = permutation_importance_cv(cv, X, y, folds, groups=groups)
+    report = importance_report(builtin, perm_single, groups)
+
+    with pd.option_context("display.float_format", lambda v: f"{v:,.4f}", "display.width", 200,
+                           "display.max_colwidth", 40):
+        print("\nTop 20 features (gain) with split and permutation importance:")
+        print(report["combined"].to_string())
+        print("\nAgreement between methods:")
+        print(report["agreement"].to_string())
+        print("\nTop 15 by grouped permutation importance:")
+        print(perm_grouped.head(15).to_string())
+        print("\nCorrelated groups:")
+        for g in groups:
+            print(f"  {len(g):>2} sensors: {', '.join(g)}")
+
+
+def main():
+    train_df, test_df, X, y, folds = _load()
     print(f"Cost of inspecting nobody: {no_inspection_cost(train_df):,.2f}\n")
 
     experiments = {
@@ -392,4 +521,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # python src/lightgbm_model.py [compare|importance]
+    step = sys.argv[1] if len(sys.argv) > 1 else "compare"
+    {"compare": main, "importance": run_importance}[step]()
