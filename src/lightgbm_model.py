@@ -103,6 +103,41 @@ def build_lr_benchmark() -> Pipeline:
 
 
 # --------------------------------------------------
+# LightGBM
+# --------------------------------------------------
+
+# Baseline configuration (before tuning). No early stopping: stopping on the
+# validation fold would let it influence training. Missing values are passed
+# through unchanged; LightGBM learns a default direction for them at each split,
+# which keeps the missingness signal found in the EDA.
+DEFAULT_LGBM_PARAMS = dict(
+    n_estimators=500,
+    learning_rate=0.03,
+    num_leaves=31,
+    min_child_samples=20,
+    subsample=0.8,
+    subsample_freq=1,
+    colsample_bytree=0.5,
+    reg_lambda=1.0,
+    random_state=RANDOM_STATE,
+    n_jobs=-1,
+    verbose=-1,
+)
+
+
+def build_lgbm(**overrides):
+    """LightGBM classifier with the baseline parameters (overridable)."""
+    import lightgbm as lgb
+
+    return lgb.LGBMClassifier(**{**DEFAULT_LGBM_PARAMS, **overrides})
+
+
+def build_lgbm_all_features(**overrides) -> Pipeline:
+    """Task 6: LightGBM on all base features, no preprocessing needed."""
+    return Pipeline([("model", build_lgbm(**overrides))])
+
+
+# --------------------------------------------------
 # Cost-based threshold selection
 # --------------------------------------------------
 
@@ -216,6 +251,19 @@ def no_inspection_cost(train_df: pd.DataFrame) -> float:
     return float(train_df["repair_cost"].fillna(0).sum())
 
 
+def comparison_table(evaluations: list) -> pd.DataFrame:
+    """One row per model, sorted by OOF cost (lower is better)."""
+    cols = ["oof_cost", "cost_per_1000_vehicles", "fold_cost_mean", "fold_cost_std", "flagged", "tp", "fn", "fp",
+            "recall", "precision", "roc_auc_mean", "roc_auc_std", "pr_auc_mean", "pr_auc_std", "threshold"]
+    table = pd.DataFrame([e["summary"] for e in evaluations]).set_index("model")[cols]
+    return table.sort_values("oof_cost")
+
+
+def per_fold_costs(evaluations: list) -> pd.DataFrame:
+    """Fold-by-fold cost for each model (same folds, so directly comparable)."""
+    return pd.DataFrame({e["summary"]["model"]: e["per_fold"].set_index("fold")["cost"] for e in evaluations})
+
+
 # --------------------------------------------------
 # Command line
 # --------------------------------------------------
@@ -229,12 +277,21 @@ def main():
     print(f"Training rows: {len(X):,} | features: {len(features)} | folds: {len(folds)}")
     print(f"Cost of inspecting nobody: {no_inspection_cost(train_df):,.2f}\n")
 
-    lr = run_cv(build_lr_benchmark(), X, y, folds, name="LR benchmark (1:50)")
-    result = evaluate_cost(lr, train_df, folds)
-    print("\nLR benchmark:")
-    print(pd.Series(result["summary"]).to_string())
-    print("\nPer fold:")
-    print(result["per_fold"].to_string(index=False))
+    experiments = {
+        "LR benchmark (1:50)": build_lr_benchmark(),
+        "LGBM all features": build_lgbm_all_features(),
+    }
+    evaluations = []
+    for name, model in experiments.items():
+        cv = run_cv(model, X, y, folds, name=name)
+        evaluations.append(evaluate_cost(cv, train_df, folds))
+        print()
+
+    with pd.option_context("display.float_format", lambda v: f"{v:,.4f}", "display.width", 200):
+        print("Comparison (sorted by OOF cost):")
+        print(comparison_table(evaluations).T.to_string())
+        print("\nCost per fold:")
+        print(per_fold_costs(evaluations).to_string())
 
 
 if __name__ == "__main__":
