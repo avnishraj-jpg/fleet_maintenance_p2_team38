@@ -18,7 +18,8 @@ from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 
-from src.cv_utils import PROJECT_ROOT, RESULTS_DIR, load_folds
+from src.config import PROJECT_ROOT, RESULTS_DIR
+from src.cv_utils import load_folds
 from src.cost_model import fit_constant_budget
 from src.evaluation import calculate_cost, tune_policy
 from src.preprocessing import fit_preprocessor, transform_features

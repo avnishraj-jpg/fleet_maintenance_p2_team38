@@ -25,7 +25,6 @@ validation information into model selection.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -41,13 +40,8 @@ from sklearn.metrics import roc_auc_score, silhouette_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from preprocessing import CONSTANT_SENSORS, get_sensor_columns  # noqa: E402
-
-RANDOM_STATE = 42
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
+from src.config import DATA_DIR, RANDOM_STATE
+from src.preprocessing import CONSTANT_SENSORS, get_sensor_columns
 
 # Thresholds used to flag sensors.
 QUASI_CONSTANT_TOP_FREQ = 0.99   # one value covers >= 99% of observed rows
