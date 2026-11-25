@@ -1,4 +1,4 @@
-"""LightGBM failure model for Fleet Maintenance Planning (Member 3 - Shaik Mohd Aatiq).
+"""LightGBM failure model for Fleet Maintenance Planning.
 
 All experiments use the team's shared 5-fold CV indices (results/cv_folds.npz,
 loaded with cv_utils.load_folds). Every model is a scikit-learn Pipeline that is
@@ -97,7 +97,7 @@ class FoldPreprocessor(BaseEstimator, TransformerMixin):
 
 
 def build_lr_benchmark() -> Pipeline:
-    """Aatiq's V1 model: median imputation + scaling + LR with class weight 1:50."""
+    """V1 model: median imputation + scaling + LR with class weight 1:50."""
     return Pipeline([
         ("preprocess", FoldPreprocessor(imputation="median", scale=True)),
         ("model", build_model(class_weight=CHOSEN_CONFIG["class_weight"])),
@@ -662,24 +662,163 @@ def run_seed_check():
     print("\nMean:", table.mean().round(0).to_dict(), "| std:", table.std().round(0).to_dict())
 
 
+# --------------------------------------------------
+# Diagnostics and charts (used by notebooks/lightgbm.ipynb)
+# --------------------------------------------------
+
+def per_fold_best_costs(cv_result: dict, train_df: pd.DataFrame, folds) -> pd.DataFrame:
+    """Per-fold cost at the pooled OOF threshold vs at each fold's own best threshold.
+
+    The gap shows how much cost comes from the threshold not transferring
+    between folds, rather than from worse ranking.
+    """
+    oof = cv_result["oof"]
+    repair = train_df["repair_cost"].to_numpy()
+    pooled_thr, _ = fast_select_threshold(oof, repair, fit_constant_budget(train_df))
+    rows = []
+    for k, (tr_idx, va_idx) in enumerate(folds, start=1):
+        b = fit_constant_budget(train_df.iloc[tr_idx])
+        best_thr, best_cost = fast_select_threshold(oof[va_idx], repair[va_idx], b)
+        flags = (oof[va_idx] >= pooled_thr).astype(int)
+        pooled_cost = evaluate_predictions(train_df["failure"].iloc[va_idx], oof[va_idx], repair[va_idx], flags,
+                                           np.where(flags == 1, b, 0.0))["total_cost"]
+        rows.append({"fold": k, "cost_at_pooled_threshold": pooled_cost, "cost_at_fold_best_threshold": best_cost,
+                     "fold_best_threshold": best_thr,
+                     "median_risk_of_failed": float(np.median(oof[va_idx][train_df["failure"].to_numpy()[va_idx] == 1]))})
+    return pd.DataFrame(rows).set_index("fold")
+
+
+def cost_curve(oof, train_df: pd.DataFrame, max_flagged: int = 4000) -> pd.Series:
+    """OOF cost as a function of how many vehicles are flagged (highest risk first)."""
+    actual = train_df["repair_cost"].fillna(0).to_numpy()
+    b = fit_constant_budget(train_df)
+    inspected = 10.0 + 0.20 * np.maximum(actual - b, 0.0) + 0.02 * np.maximum(b - actual, 0.0)
+    delta = (inspected - actual)[np.argsort(-np.asarray(oof), kind="stable")]
+    costs = actual.sum() + np.r_[0.0, np.cumsum(delta)]
+    return pd.Series(costs[: max_flagged + 1], index=np.arange(min(max_flagged, len(delta)) + 1), name="cost")
+
+
+def plot_cost_curves(curves: dict, title: str = "OOF cost vs number of vehicles flagged"):
+    """One line per model; the minimum of each curve is marked."""
+    import matplotlib.pyplot as plt
+    from feature_analysis import INK_2, SERIES, SURFACE
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    # Lowest curve's label goes below its point, the others above, so labels never overlap
+    lowest = min(curves, key=lambda n: curves[n].min())
+    for colour, (name, curve) in zip(SERIES, curves.items()):
+        ax.plot(curve.index, curve.values / 1000, color=colour, label=name)
+        best = curve.idxmin()
+        ax.scatter([best], [curve.min() / 1000], s=60, color=colour, edgecolor=SURFACE, linewidth=2, zorder=3)
+        ax.annotate(f"min {curve.min() / 1000:,.1f}k at {best:,} flagged", (best, curve.min() / 1000),
+                    textcoords="offset points", xytext=(8, -16 if name == lowest else 10), fontsize=8,
+                    color=INK_2)
+    ax.set(xlabel="Vehicles flagged for inspection (highest predicted risk first)",
+           ylabel="Total OOF cost (thousands)", title=title)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def plot_fold_costs(fold_costs: pd.DataFrame, title: str = "Cost per fold (same shared folds)"):
+    """Dot plot: one row per fold, one coloured dot per model."""
+    import matplotlib.pyplot as plt
+    from feature_analysis import AXIS, SERIES, SURFACE
+
+    fig, ax = plt.subplots(figsize=(8, 0.6 * len(fold_costs) + 1.5))
+    ypos = np.arange(len(fold_costs))
+    ax.hlines(ypos, fold_costs.min(axis=1) / 1000, fold_costs.max(axis=1) / 1000, color=AXIS, lw=1.5)
+    for colour, model in zip(SERIES, fold_costs.columns):
+        ax.scatter(fold_costs[model] / 1000, ypos, s=60, color=colour, label=model,
+                   edgecolor=SURFACE, linewidth=2, zorder=3)
+    ax.set_yticks(ypos, [f"fold {f}" for f in fold_costs.index])
+    ax.invert_yaxis()
+    ax.set(xlabel="Validation-fold cost (thousands)", title=title)
+    ax.grid(axis="y", visible=False)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=min(3, fold_costs.shape[1]))
+    fig.tight_layout()
+    return fig
+
+
+def plot_importance_bars(values: pd.Series, title: str, xlabel: str, top: int = 20):
+    """Horizontal bars for the `top` largest values."""
+    import matplotlib.pyplot as plt
+    from feature_analysis import BLUE
+
+    d = values.head(top).iloc[::-1]
+    fig, ax = plt.subplots(figsize=(7.5, 0.26 * len(d) + 1.2))
+    ax.barh([str(i) for i in d.index], d.values, height=0.6, color=BLUE)
+    ax.set(xlabel=xlabel, title=title)
+    ax.grid(axis="y", visible=False)
+    fig.tight_layout()
+    return fig
+
+
+def plot_tuning(trials: pd.DataFrame):
+    """OOF cost of every tuning trial vs its worst cost when the threshold is halved or doubled."""
+    import matplotlib.pyplot as plt
+    from feature_analysis import BLUE, INK_2, ORANGE, SURFACE
+
+    worst = trials[["cost_thr_x0.5", "cost_thr_x2"]].max(axis=1)
+    fig, ax = plt.subplots(figsize=(7.5, 4.8))
+    ax.scatter(trials["oof_cost"] / 1000, worst / 1000, s=40, color=BLUE, edgecolor=SURFACE, linewidth=1.5,
+               label="tuning trial")
+    for trial, colour in [(0, ORANGE)]:
+        ax.scatter(trials.loc[trial, "oof_cost"] / 1000, worst.loc[trial] / 1000, s=70, color=colour,
+                   edgecolor=SURFACE, linewidth=2, label="default (trial 0)", zorder=3)
+    for trial in trials.index[:3].tolist() + [2]:
+        ax.annotate(f"trial {trial}", (trials.loc[trial, "oof_cost"] / 1000, worst.loc[trial] / 1000),
+                    textcoords="offset points", xytext=(6, 4), fontsize=8, color=INK_2)
+    ax.set(xlabel="OOF cost at the chosen threshold (thousands)",
+           ylabel="Worst cost if threshold halved or doubled (thousands)",
+           title="Tuning trials: cost vs robustness (lower-left is better)")
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def plot_test_vs_cv(test_vs_cv: pd.DataFrame):
+    """Share of vehicles flagged: CV vs each set of test predictions."""
+    import matplotlib.pyplot as plt
+    from feature_analysis import BLUE, ORANGE
+
+    d = test_vs_cv
+    fig, ax = plt.subplots(figsize=(7.5, 3.8))
+    y = np.arange(len(d))
+    ax.barh(y - 0.18, d["cv_flag_rate"] * 100, height=0.34, color=BLUE, label="CV (out-of-fold)")
+    ax.barh(y + 0.18, d["test_flag_rate"] * 100, height=0.34, color=ORANGE, label="test")
+    ax.set_yticks(y, d.index)
+    ax.invert_yaxis()
+    ax.set(xlabel="Vehicles flagged (%)", title="Inspection rate: test vs CV")
+    ax.grid(axis="y", visible=False)
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    return fig
+
+
 SUBMISSIONS_DIR = Path(__file__).resolve().parent.parent / "submissions"
 
 
-def run_final():
-    """Final model: CV of the seed-averaged tuned LightGBM, test predictions, submissions."""
-    train_df, test_df, X, y, folds = _load()
+FINAL_NAME, LR_NAME = "LGBM tuned, 5-seed average", "LR benchmark (1:50)"
+
+
+def final_report(train_df, test_df, X, y, folds, cv_results: dict | None = None,
+                 write_submissions: bool = True, verbose: bool = True) -> dict:
+    """Final model: CV of the seed-averaged tuned LightGBM, test predictions, submissions.
+
+    cv_results: optional {name: run_cv result} to reuse CV runs that already
+    exist (keys FINAL_NAME / LR_NAME).
+    """
+    cv_results = dict(cv_results or {})
     features = list(X.columns)
     test_aligned = align_test_sensors(test_df, train_df)
     budget = fit_constant_budget(train_df)
 
     # 1. CV: thresholds come from the same kind of model that predicts test
-    models = {"LGBM tuned, 5-seed average": build_final_lgbm(), "LR benchmark (1:50)": build_lr_benchmark()}
-    evals = {}
-    for name, model in models.items():
-        evals[name] = evaluate_cost(run_cv(model, X, y, folds, name=name), train_df, folds)
-    with pd.option_context("display.float_format", lambda v: f"{v:,.4f}", "display.width", 200):
-        print("\nCV results:")
-        print(comparison_table(list(evals.values())).T.to_string())
+    for name, builder in [(FINAL_NAME, build_final_lgbm), (LR_NAME, build_lr_benchmark)]:
+        if name not in cv_results:
+            cv_results[name] = run_cv(builder(), X, y, folds, name=name, verbose=verbose)
+    evals = {name: evaluate_cost(cv_results[name], train_df, folds) for name in (FINAL_NAME, LR_NAME)}
 
     # 2. Fit on all training data and predict test
     lgbm = build_final_lgbm().fit(X, y)
@@ -690,10 +829,8 @@ def run_final():
         "lr_aligned": lr.predict_proba(test_aligned[features])[:, 1],
         "lr_raw": lr.predict_proba(test_df[features])[:, 1],
     }
-    thr = {"lgbm": evals["LGBM tuned, 5-seed average"]["summary"]["threshold"],
-           "lr": evals["LR benchmark (1:50)"]["summary"]["threshold"]}
-    cv_rate = {k: evals[n]["summary"]["flagged"] / len(X) for k, n in
-               [("lgbm", "LGBM tuned, 5-seed average"), ("lr", "LR benchmark (1:50)")]}
+    thr = {"lgbm": evals[FINAL_NAME]["summary"]["threshold"], "lr": evals[LR_NAME]["summary"]["threshold"]}
+    cv_rate = {k: evals[n]["summary"]["flagged"] / len(X) for k, n in [("lgbm", FINAL_NAME), ("lr", LR_NAME)]}
 
     # 3. Diagnostics: inspection rate on test vs CV, raw vs aligned test
     rows = []
@@ -704,26 +841,44 @@ def run_final():
                      "test_flag_rate": flags.mean(), "cv_flag_rate": cv_rate[model],
                      "mean_probability": probs.mean()})
     diag = pd.DataFrame(rows).set_index("predictions")
-    fa, fr = p["lgbm_aligned"] >= thr["lgbm"], p["lgbm_raw"] >= thr["lgbm"]
-    agreement = pd.Series({
-        "Spearman(aligned, raw) probabilities": pd.Series(p["lgbm_aligned"]).corr(pd.Series(p["lgbm_raw"]), "spearman"),
-        "flagged in both": int((fa & fr).sum()),
-        "flagged only with aligned test": int((fa & ~fr).sum()),
-        "flagged only with raw test": int((~fa & fr).sum()),
-    })
-    with pd.option_context("display.float_format", lambda v: f"{v:,.4f}", "display.width", 200):
-        print(f"\nBudget for inspected vehicles: {budget:,.2f}")
-        print("\nTest predictions vs CV:")
-        print(diag.to_string())
-        print("\nLightGBM, aligned vs raw test:")
-        print(agreement.to_string())
+    agreement = {}
+    for model in ("lgbm", "lr"):
+        fa_, fr_ = p[f"{model}_aligned"] >= thr[model], p[f"{model}_raw"] >= thr[model]
+        agreement[model.upper()] = {
+            "Spearman(aligned, raw) probabilities":
+                pd.Series(p[f"{model}_aligned"]).corr(pd.Series(p[f"{model}_raw"]), method="spearman"),
+            "flagged in both": int((fa_ & fr_).sum()),
+            "flagged only with aligned test": int((fa_ & ~fr_).sum()),
+            "flagged only with raw test": int((~fa_ & fr_).sum()),
+        }
+    agreement = pd.DataFrame(agreement)
 
     # 4. Submissions (submissions/ is ignored by git)
-    SUBMISSIONS_DIR.mkdir(exist_ok=True)
-    for key, model in [("lgbm_aligned", "lgbm"), ("lgbm_raw", "lgbm"), ("lr_aligned", "lr")]:
-        path = SUBMISSIONS_DIR / f"v2_{key}.csv"
-        make_submission(test_df, p[key], thr[model], budget).to_csv(path, index=False)
-        print(f"Saved {path.name}")
+    saved = []
+    if write_submissions:
+        SUBMISSIONS_DIR.mkdir(exist_ok=True)
+        for key, model in [("lgbm_aligned", "lgbm"), ("lgbm_raw", "lgbm"), ("lr_aligned", "lr")]:
+            path = SUBMISSIONS_DIR / f"v2_{key}.csv"
+            make_submission(test_df, p[key], thr[model], budget).to_csv(path, index=False)
+            saved.append(path.name)
+
+    return {"cv_results": cv_results, "evaluations": evals, "probabilities": p, "thresholds": thr,
+            "budget": budget, "test_vs_cv": diag, "raw_vs_aligned": agreement, "saved": saved}
+
+
+def run_final():
+    """Command-line wrapper around final_report()."""
+    train_df, test_df, X, y, folds = _load()
+    r = final_report(train_df, test_df, X, y, folds)
+    with pd.option_context("display.float_format", lambda v: f"{v:,.4f}", "display.width", 200):
+        print("\nCV results:")
+        print(comparison_table(list(r["evaluations"].values())).T.to_string())
+        print(f"\nBudget for inspected vehicles: {r['budget']:,.2f}")
+        print("\nTest predictions vs CV:")
+        print(r["test_vs_cv"].to_string())
+        print("\nAligned vs raw test:")
+        print(r["raw_vs_aligned"].to_string())
+    print("Saved:", ", ".join(r["saved"]))
 
 
 def main():

@@ -1,4 +1,4 @@
-"""Feature analysis for Fleet Maintenance Planning (Member 3 - Shaik Mohd Aatiq).
+"""Feature analysis for Fleet Maintenance Planning.
 
 Sensor-level analysis of the 170 sensors (s000-s169). The general EDA (target,
 repair cost, basic missing values) is in notebooks/eda.ipynb sections 1-5.

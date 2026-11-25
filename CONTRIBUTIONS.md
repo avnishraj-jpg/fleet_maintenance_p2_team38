@@ -28,6 +28,19 @@ This document tracks the individual contributions of all team members.
 - Implemented `src/failure_model.py`: Logistic Regression baseline, training function, probability-prediction function, random oversampling (training data only) and evaluation (precision, recall, F1-score, ROC-AUC, confusion matrix).
 - Compared imbalance-handling approaches (balanced weights, no weighting, custom weights 1:10/1:25/1:50, random oversampling) using official validation cost after threshold selection.
 - Selected Logistic Regression with class weight 1:50 (validation cost 12,349; detects 67 of 79 failures, wrongly flags 180 healthy vehicles).
+- Implemented `src/feature_analysis.py` and Section 6 of `notebooks/eda.ipynb` (sensor-level feature analysis):
+  - Predictive signal of each sensor (univariate AUC) and of its missingness (failure rate when missing vs present).
+  - Low-variance and noisy sensors (constant, quasi-constant, high-missing, weak-signal flags).
+  - Spearman correlation analysis: 13 groups of near-duplicate sensors (|rho| > 0.95).
+  - Train vs test distribution comparison per sensor (KS statistic, PSI).
+  - Found that the test file is misaligned (s055-s063 hold train s054-s062, s047's values are in s122, s120 has a +16.02M offset) and implemented `align_test_sensors()` to fix it.
+  - Investigated depot distribution shift with adversarial validation, latent-group clustering and predicted-risk comparison (test vehicles have about 3x higher predicted failure risk).
+- Implemented `src/lightgbm_model.py` and `notebooks/lightgbm.ipynb`, using the shared 5-fold CV indices, with every preprocessing and feature-selection step fitted inside each training fold:
+  - Logistic Regression benchmark re-evaluated on the shared folds (OOF cost 81,465).
+  - LightGBM using all features (OOF cost 73,828) and using fold-wise selected features (low-variance, correlation and importance filters); selection did not improve cost.
+  - Feature importance report: gain, split, permutation and grouped permutation importance (s123 and the s012 sensor group are the most important).
+  - Tuned LightGBM with a 30-trial random search, checked against seed noise; final model is the tuned LightGBM averaged over 5 seeds (OOF cost 70,153).
+  - Generated V2 Kaggle submissions (main candidate plus two diagnostics for the test misalignment).
 
 ### Saransh Kumar Gupta (2024508)
 
