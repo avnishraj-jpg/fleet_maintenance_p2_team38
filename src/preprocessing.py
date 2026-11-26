@@ -12,12 +12,15 @@ Typical use in the notebook (after the train-validation split):
         train_part, val_part, test_df,
         imputation="median", missing_indicators=None, scale=False,
     )
+
+For cross-validation, use SensorPreprocessor as the first Pipeline step.
 """
 
 import re
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.preprocessing import StandardScaler
 
@@ -55,6 +58,11 @@ def find_high_missing_sensors(X_train: pd.DataFrame,
     return missing_frac[missing_frac > threshold].index.tolist()
 
 
+def signed_log(X):
+    """sign(x) * log(1 + |x|): compresses the very long right tails of the sensors."""
+    return np.sign(X) * np.log1p(np.abs(X))
+
+
 def fit_preprocessor(train: pd.DataFrame,
                      imputation: str = "median",
                      fill_value: float = 0.0,
@@ -62,7 +70,8 @@ def fit_preprocessor(train: pd.DataFrame,
                      missing_indicators=None,
                      drop_high_missing: bool = False,
                      scale: bool = False,
-                     high_missing_threshold: float = HIGH_MISSING_THRESHOLD) -> dict:
+                     high_missing_threshold: float = HIGH_MISSING_THRESHOLD,
+                     log_transform: bool = False) -> dict:
     """Fit all preprocessing steps on the training data only.
 
     Parameters
@@ -78,6 +87,7 @@ def fit_preprocessor(train: pd.DataFrame,
         comparison; keep them in the first baseline).
     scale : standardise imputed sensor values (useful for Logistic Regression
         and distance-based models; not needed for tree models).
+    log_transform : apply signed_log() before imputation (for skewed sensors).
 
     Returns
     -------
@@ -108,6 +118,8 @@ def fit_preprocessor(train: pd.DataFrame,
         indicator_cols = []
 
     X = train[feature_cols].astype(float)
+    if log_transform:
+        X = signed_log(X)
 
     # 3. Imputer, fitted on training data only.
     if imputation == "knn":
@@ -130,6 +142,7 @@ def fit_preprocessor(train: pd.DataFrame,
         "indicator_cols": indicator_cols,
         "imputer": imputer,
         "scaler": scaler,
+        "log_transform": log_transform,
     }
 
 
@@ -145,6 +158,8 @@ def transform_features(preprocessor: dict, df: pd.DataFrame) -> pd.DataFrame:
 
     X = df[feature_cols].astype(float)
     flags = X[preprocessor["indicator_cols"]].isna().astype(np.int8)
+    if preprocessor.get("log_transform", False):
+        X = signed_log(X)
 
     values = preprocessor["imputer"].transform(X)
     if preprocessor["scaler"] is not None:
@@ -174,16 +189,55 @@ def preprocess_data(train: pd.DataFrame, val: pd.DataFrame,
     return X_train, X_val, X_test, preprocessor
 
 
-# Settings to compare on the validation set (median baseline first).
+class SensorPreprocessor(BaseEstimator, TransformerMixin):
+    """Pipeline step for fit_preprocessor() / transform_features() (same options)."""
+
+    def __init__(self, imputation="median", fill_value=0.0, knn_neighbors=5,
+                 missing_indicators=None, drop_high_missing=False, scale=True,
+                 high_missing_threshold=HIGH_MISSING_THRESHOLD, log_transform=False):
+        self.imputation = imputation
+        self.fill_value = fill_value
+        self.knn_neighbors = knn_neighbors
+        self.missing_indicators = missing_indicators
+        self.drop_high_missing = drop_high_missing
+        self.scale = scale
+        self.high_missing_threshold = high_missing_threshold
+        self.log_transform = log_transform
+
+    def fit(self, X, y=None):
+        self.preprocessor_ = fit_preprocessor(
+            X,
+            imputation=self.imputation,
+            fill_value=self.fill_value,
+            knn_neighbors=self.knn_neighbors,
+            missing_indicators=self.missing_indicators,
+            drop_high_missing=self.drop_high_missing,
+            scale=self.scale,
+            high_missing_threshold=self.high_missing_threshold,
+            log_transform=self.log_transform,
+        )
+        return self
+
+    def transform(self, X):
+        return transform_features(self.preprocessor_, X)
+
+    def get_feature_names_out(self, input_features=None):
+        prep = self.preprocessor_
+        return np.array(prep["feature_cols"] + [f"{c}_missing" for c in prep["indicator_cols"]])
+
+
+# Settings compared on the shared CV with Logistic Regression (src/feature_selection.py).
 PREPROCESSING_EXPERIMENTS = {
-    "median (baseline)": dict(imputation="median"),
-    "mean": dict(imputation="mean"),
-    "constant 0": dict(imputation="constant", fill_value=0.0),
-    "median + high-missing indicators": dict(imputation="median",
+    "median (baseline)": dict(imputation="median", scale=True),
+    "mean": dict(imputation="mean", scale=True),
+    "constant 0": dict(imputation="constant", fill_value=0.0, scale=True),
+    "median + high-missing indicators": dict(imputation="median", scale=True,
                                              missing_indicators="high_missing"),
-    "median + all indicators": dict(imputation="median", missing_indicators="all"),
-    "median, drop high-missing": dict(imputation="median", drop_high_missing=True),
-    "median + scaling": dict(imputation="median", scale=True),
-    # Optional and slow on 56k rows - run only after the baseline works:
-    # "knn (k=5)": dict(imputation="knn", knn_neighbors=5),
+    "median + all indicators": dict(imputation="median", scale=True, missing_indicators="all"),
+    "median, drop high-missing": dict(imputation="median", scale=True, drop_high_missing=True),
+    "median + signed log": dict(imputation="median", scale=True, log_transform=True),
+    "median + signed log + all indicators": dict(imputation="median", scale=True,
+                                                 log_transform=True, missing_indicators="all"),
+    # Optional and slow on 56k rows (pass --knn to the experiment runner):
+    # "knn (k=5)": dict(imputation="knn", knn_neighbors=5, scale=True),
 }
