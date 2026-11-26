@@ -27,6 +27,14 @@ from sklearn.preprocessing import StandardScaler
 # EDA: s146 has a single observed value (~939138.7) in both train and test.
 CONSTANT_SENSORS = ["s146"]
 
+# Sensors identified as unreliable due to missingness, corruption,
+# train-test mismatch, or distribution drift.
+UNRELIABLE_SENSORS = [
+    "s027", "s038", "s047", "s055", "s056",
+    "s057", "s059", "s062", "s063", "s113",
+    "s120", "s122", "s132", "s154",
+]
+
 # EDA: eight sensors have more than 50% missing values in training.
 HIGH_MISSING_THRESHOLD = 0.50
 

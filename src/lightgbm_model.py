@@ -15,18 +15,34 @@ from src.cv_utils import (
     validate_folds,
 )
 from src.feature_analysis import align_test_sensors, find_unavailable_in_test
-from src.preprocessing import CONSTANT_SENSORS
+from src.preprocessing import CONSTANT_SENSORS, UNRELIABLE_SENSORS
 
+DROP_FEATURES = [
+    "s027", "s038", "s047", "s055", "s056",
+    "s057", "s059", "s062", "s063", "s113",
+    "s120", "s122", "s132", "s154",
+]
 
-def get_base_features(train_df: pd.DataFrame, test_df: pd.DataFrame) -> list:
-    """Return sensor features available and usable in both train and test."""
+def get_base_features(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    test_already_aligned: bool = False,
+) -> list:
+    """Return reliable sensor features available in both train and test."""
     X, _ = prepare_training_data(train_df)
     sensors = list(X.columns)
 
-    test_aligned = align_test_sensors(test_df, train_df)
+    # Align only the original, uncorrected test data.
+    test_features = (
+        test_df
+        if test_already_aligned
+        else align_test_sensors(test_df, train_df)
+    )
+
     excluded = (
-        set(find_unavailable_in_test(train_df, test_aligned, sensors))
+        set(find_unavailable_in_test(train_df, test_features, sensors))
         | set(CONSTANT_SENSORS)
+        | set(UNRELIABLE_SENSORS)
     )
 
     return [column for column in sensors if column not in excluded]
