@@ -47,6 +47,11 @@ This document tracks the individual contributions of all team members.
   - Feature importance report: gain, split, permutation and grouped permutation importance (s123 and the s012 sensor group are the most important).
   - Tuned LightGBM with a 30-trial random search, checked against seed noise; final model is the tuned LightGBM averaged over 5 seeds (OOF cost 70,153).
   - Generated V2 Kaggle submissions (main candidate plus two diagnostics for the test misalignment).
+- V3: implemented `src/ensemble_model.py` (failure-probability ensemble):
+  - `build_catboost()`, `build_xgboost()` and `build_hist_gradient_boosting()` with the V3 configurations, each averaged over seeds 42, 7 and 123.
+  - `FailureProbabilityEnsemble`: scikit-learn compatible `fit()` / `predict_proba()` (equal-weight average of the three families), plus `predict_failure_probability()` and `predict_family_proba()`. Missing values are handled natively (no imputation).
+  - Tested on the shared 5-fold CV with the 167 base features: probabilities lie in [0, 1] and row order is preserved. Runtime: CV 9.0 min, final fit 2.0 min.
+  - OOF comparison (V2 constant-budget policy): HistGradientBoosting 66,937; V2 LightGBM 70,153; V3 ensemble 70,271; XGBoost 71,837; CatBoost 74,117. The ensemble has the best PR-AUC (0.537) but ties with V2 on cost; the three families' probabilities are on different scales, so the equal-weight average is dominated by the larger-probability models.
 
 ### Saransh Kumar Gupta (2024508)
 
