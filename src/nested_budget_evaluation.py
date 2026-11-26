@@ -31,6 +31,7 @@ INNER_SPLITS = 4
 RANDOM_STATE = 42
 
 
+
 def make_repair_models():
     """Create fresh repair-cost regressors."""
     return {
@@ -40,6 +41,7 @@ def make_repair_models():
             random_state=42,
             n_jobs=2,
         ),
+
         "xgb": XGBRegressor(
             n_estimators=100,
             max_depth=3,
@@ -47,7 +49,21 @@ def make_repair_models():
             random_state=42,
             n_jobs=2,
         ),
+
+        # Existing mean-regression LightGBM
         "lgbm": LGBMRegressor(
+            n_estimators=100,
+            num_leaves=8,
+            learning_rate=0.05,
+            verbosity=-1,
+            random_state=42,
+            n_jobs=2,
+        ),
+
+        # New: quantile regression targeting the 90.91th percentile
+        "lgbm_q91": LGBMRegressor(
+            objective="quantile",
+            alpha=0.9090909,
             n_estimators=100,
             num_leaves=8,
             learning_rate=0.05,
@@ -151,8 +167,15 @@ def run_nested_evaluation():
 
         inner_budgets = {
             name: np.full(len(outer_train), np.nan)
-            for name in ["constant", "median", "forest", "xgb", "lgbm"]
-        }
+            for name in [
+                "constant",
+                "median",
+                "forest",
+                "xgb",
+                "lgbm",
+                "lgbm_q91",
+            ]
+}
 
         inner_cv = StratifiedKFold(
             n_splits=INNER_SPLITS,
