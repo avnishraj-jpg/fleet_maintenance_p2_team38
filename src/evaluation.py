@@ -336,3 +336,167 @@ def tune_policy(
             }
 
     return best
+
+
+# ------------------------------------------------------------------
+# V3 probability-aware mixture budget policy
+# ------------------------------------------------------------------
+
+V3_Q_STAR = 0.20 / (0.20 + 0.02)
+
+
+def get_repair_cost_ratios(actual_costs, predicted_budgets):
+    """Calculate actual/predicted repair-cost ratios from failed vehicles."""
+
+    actual = np.asarray(actual_costs, dtype=float)
+    predicted = np.asarray(predicted_budgets, dtype=float)
+
+    if actual.ndim != 1 or predicted.ndim != 1:
+        raise ValueError("Cost inputs must be one-dimensional.")
+
+    if len(actual) != len(predicted):
+        raise ValueError("Cost inputs must have equal lengths.")
+
+    valid = (
+        np.isfinite(actual)
+        & np.isfinite(predicted)
+        & (actual > 0)
+        & (predicted > 0)
+    )
+
+    ratios = actual[valid] / predicted[valid]
+
+    if len(ratios) == 0:
+        raise ValueError("No valid repair-cost ratios available.")
+
+    return np.sort(ratios)
+
+
+def predict_mixture_budgets(probabilities, predicted_costs, ratios):
+    """Calculate probability-aware budgets using the V3 mixture quantile."""
+
+    p = np.asarray(probabilities, dtype=float)
+    c_hat = np.asarray(predicted_costs, dtype=float)
+    ratios = np.asarray(ratios, dtype=float)
+
+    if p.ndim != 1 or c_hat.ndim != 1 or ratios.ndim != 1:
+        raise ValueError("All inputs must be one-dimensional.")
+
+    if len(p) != len(c_hat):
+        raise ValueError("Probabilities and predicted costs must align.")
+
+    if len(ratios) == 0:
+        raise ValueError("At least one repair-cost ratio is required.")
+
+    if not (
+        np.isfinite(p).all()
+        and np.isfinite(c_hat).all()
+        and np.isfinite(ratios).all()
+    ):
+        raise ValueError("All inputs must be finite.")
+
+    if ((p < 0) | (p > 1)).any():
+        raise ValueError("Probabilities must lie between 0 and 1.")
+
+    if (c_hat < 0).any() or (ratios <= 0).any():
+        raise ValueError("Predicted costs must be non-negative and ratios positive.")
+
+    level = np.where(
+        p > 1 - V3_Q_STAR,
+        1 - (1 - V3_Q_STAR) / np.maximum(p, 1e-12),
+        0.0,
+    )
+
+    ratio_quantiles = np.quantile(
+        ratios,
+        np.clip(level, 0.0, 1.0),
+    )
+
+    budgets = c_hat * ratio_quantiles
+
+    return np.where(p > 1 - V3_Q_STAR, budgets, 0.0)
+
+
+def tune_v3_policy(
+    probabilities,
+    actual_costs,
+    predicted_costs,
+    ratios,
+):
+    """Select the V3 inspection threshold using mixture-based budgets."""
+
+    p = np.asarray(probabilities, dtype=float)
+    actual = np.nan_to_num(
+        np.asarray(actual_costs, dtype=float),
+        nan=0.0,
+    )
+
+    if not (len(p) == len(actual) == len(predicted_costs)):
+        raise ValueError("Policy inputs have different lengths.")
+
+    if len(p) == 0:
+        raise ValueError("Policy inputs must not be empty.")
+
+    if not (
+        np.isfinite(p).all()
+        and np.isfinite(actual).all()
+        and np.isfinite(np.asarray(predicted_costs, dtype=float)).all()
+    ):
+        raise ValueError("Policy inputs must be finite.")
+
+    if ((p < 0) | (p > 1)).any() or (actual < 0).any():
+        raise ValueError("Invalid probabilities or actual costs.")
+
+    budgets = predict_mixture_budgets(p, predicted_costs, ratios)
+
+    order = np.argsort(-p, kind="stable")
+    sorted_p = p[order]
+
+    group_ends = np.r_[
+        np.flatnonzero(np.diff(sorted_p) != 0),
+        len(sorted_p) - 1,
+    ]
+
+    actual_cost = (
+        10.0
+        + 0.20 * np.maximum(actual - budgets, 0.0)
+        + 0.02 * np.maximum(budgets - actual, 0.0)
+    )
+
+    delta = actual_cost - actual
+    cumulative_delta = np.cumsum(delta[order])
+
+    candidate_costs = actual.sum() + cumulative_delta[group_ends]
+    no_inspection_cost = actual.sum()
+
+    candidate_idx = int(np.argmin(candidate_costs))
+
+    if candidate_costs[candidate_idx] < no_inspection_cost:
+        threshold = float(sorted_p[group_ends[candidate_idx]])
+        cost = float(candidate_costs[candidate_idx])
+    else:
+        threshold = float(np.nextafter(p.max(), np.inf))
+        cost = float(no_inspection_cost)
+
+    return {
+        "cost": cost,
+        "threshold": threshold,
+    }
+
+
+def apply_v3_policy(probabilities, predicted_costs, ratios, threshold):
+    """Apply the selected V3 threshold and generate inspection budgets."""
+
+    p = np.asarray(probabilities, dtype=float)
+
+    flags = (p >= threshold).astype(int)
+
+    budgets = predict_mixture_budgets(
+        p,
+        predicted_costs,
+        ratios,
+    )
+
+    budgets = np.where(flags == 1, budgets, 0.0)
+
+    return flags, budgets
