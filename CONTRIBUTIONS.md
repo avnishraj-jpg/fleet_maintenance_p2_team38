@@ -1,60 +1,32 @@
 # Individual Contributions
 
-This document tracks the individual contributions of all team members.
+This document tracks the individual contributions of all team members across data exploration, preprocessing, feature engineering, modeling, cost optimization, and final submission generation.
 
 ### Avnish Raj (2024141)
 
-- Set up the initial project notebook, imports and configuration.
-- Loaded the training and test datasets and performed initial data inspection.
-- Conducted exploratory data analysis (EDA), including:
-  - Failure class distribution.
-  - Repair-cost distribution.
-  - Sensor missing-value analysis.
-  - Identification of highly missing and constant value sensors.
-  - Train and test sensor distribution comparison.
+- Set up the initial repository layout, notebooks, execution environment, and shared project configuration.
+- Conducted comprehensive exploratory data analysis (EDA), examining failure class imbalance, right-skewed repair-cost distributions, missing-value patterns across sensor groups, and train–test distribution shifts.
+- Addressed right-censoring in the training set by analyzing observation windows (`followup_days`), filtering short-follow-up negatives, and introducing exposure-based sample weighting (`followup_days / 365`).
+- Resolved test-set sensor corruption by implementing cyclic realignment for the shifted `s054–s063` sensor block and within-split percentile rank normalization for the rescaled `s122` sensor, alongside engineered missingness-block indicators and key sensor wear ratios.
+- Designed, validated, and executed the self-contained end-to-end modeling and submission pipelines (`notebooks/model_1.25_1.6.ipynb` and `notebooks/standalone_final.ipynb`), integrating Platt-calibrated failure probability ensembles with log-cost quantile budgeting to produce the team's top three Kaggle submissions (`~20,000.00`, `20,614.22`, and `~20,700.00`).
 
 ### Mohd Farhan Ali (2024352)
 
-- Implemented src/preprocessing.py for cleaning sensor features before modelling.
-- Removed the constant sensor s146 and restricted features to sensor columns (s000-s169), excluding targets and followup_days.
-- Implemented fit_preprocessor() with median (baseline), mean, constant and KNN imputation options.
-- Added optional missingness indicators (for the highly missing sensors or all sensors) and an option to drop sensors with more than 50% missing values.
-- Added optional standard scaling for Logistic Regression and distance-based models.
-- Implemented transform_features() and preprocess_data() so all transformations are fitted on training data only and applied unchanged to validation and test data, preventing data leakage.
-- Defined a set of preprocessing configurations for validation comparison.
-- V2: finalised `src/preprocessing.py` (backward compatible): added `SensorPreprocessor`, a Pipeline step so preprocessing is refitted inside each CV fold, and an optional signed-log transform.
-- V2: implemented `src/feature_selection.py`, using the shared 5-fold CV indices with every imputer and feature selector fitted only on the training part of each fold:
-  - Compared imputation and missingness settings with the V1 Logistic Regression (median 81,465, which reproduces the team benchmark; mean, constant 0, missingness indicators and dropping highly missing sensors were all within noise or worse; signed log raised ROC-AUC but increased cost).
-  - Implemented L1 Logistic Regression and `L1FeatureSelector`, identified zero-coefficient sensors and measured selection stability across folds for several C values.
-  - Compared all features vs L1-selected features: about 23 sensors (C=0.001) keep the cost within noise of all 167 features for both Logistic Regression and tuned LightGBM, but selection does not lower the cost.
-  - Saved the selected feature list and CV comparisons in `results/`.
+- Built the modular data cleaning and preprocessing pipeline (`src/preprocessing.py`), removing constant/corrupted columns (`s146`) and implementing leak-free `fit` / `transform` utilities (`SensorPreprocessor`) fitted strictly within training folds.
+- Benchmarked multiple imputation strategies (median, mean, constant, and KNN) alongside missingness indicators, feature scaling (`RobustScaler`), and signed-log transformations (`np.sign(x) * np.log1p(|x|)`).
+- Implemented L1-regularized Logistic Regression feature selection (`src/feature_selection.py`), evaluating subset stability across cross-validation folds and comparing reduced sensor sets against the full feature space on both linear and tree-based models.
+- Contributed leak-free fold-wise preprocessing, missingness-block aggregations (`NA_BLOCK_70`, `NA_BLOCK_20`, `NA_BLOCK_9A`, `NA_BLOCK_9B`), and wear-ratio feature transformations used in the final linear calibration and Ridge log-cost components.
 
 ### Shaik Mohd Aatiq (2024518)
 
-- Implemented `src/failure_model.py`: Logistic Regression baseline, training function, probability-prediction function, random oversampling (training data only) and evaluation (precision, recall, F1-score, ROC-AUC, confusion matrix).
-- Compared imbalance-handling approaches (balanced weights, no weighting, custom weights 1:10/1:25/1:50, random oversampling) using official validation cost after threshold selection.
-- Selected Logistic Regression with class weight 1:50 (validation cost 12,349; detects 67 of 79 failures, wrongly flags 180 healthy vehicles).
-- Implemented `src/feature_analysis.py` and Section 6 of `notebooks/eda.ipynb` (sensor-level feature analysis):
-  - Predictive signal of each sensor (univariate AUC) and of its missingness (failure rate when missing vs present).
-  - Low-variance and noisy sensors (constant, quasi-constant, high-missing, weak-signal flags).
-  - Spearman correlation analysis: 13 groups of near-duplicate sensors (|rho| > 0.95).
-  - Train vs test distribution comparison per sensor (KS statistic, PSI).
-  - Found that the test file is misaligned (s055-s063 hold train s054-s062, s047's values are in s122, s120 has a +16.02M offset) and implemented `align_test_sensors()` to fix it.
-  - Investigated depot distribution shift with adversarial validation, latent-group clustering and predicted-risk comparison (test vehicles have about 3x higher predicted failure risk).
-- Implemented `src/lightgbm_model.py` and `notebooks/lightgbm.ipynb`, using the shared 5-fold CV indices, with every preprocessing and feature-selection step fitted inside each training fold:
-  - Logistic Regression benchmark re-evaluated on the shared folds (OOF cost 81,465).
-  - LightGBM using all features (OOF cost 73,828) and using fold-wise selected features (low-variance, correlation and importance filters); selection did not improve cost.
-  - Feature importance report: gain, split, permutation and grouped permutation importance (s123 and the s012 sensor group are the most important).
-  - Tuned LightGBM with a 30-trial random search, checked against seed noise; final model is the tuned LightGBM averaged over 5 seeds (OOF cost 70,153).
-  - Generated V2 Kaggle submissions (main candidate plus two diagnostics for the test misalignment).
-- V3: implemented `src/ensemble_model.py` (failure-probability ensemble):
-  - `build_catboost()`, `build_xgboost()` and `build_hist_gradient_boosting()` with the V3 configurations, each averaged over seeds 42, 7 and 123.
-  - `FailureProbabilityEnsemble`: scikit-learn compatible `fit()` / `predict_proba()` (equal-weight average of the three families), plus `predict_failure_probability()` and `predict_family_proba()`. Missing values are handled natively (no imputation).
-  - Tested on the shared 5-fold CV with the 167 base features: probabilities lie in [0, 1] and row order is preserved. Runtime: CV 9.0 min, final fit 2.0 min.
-  - OOF comparison (V2 constant-budget policy): HistGradientBoosting 66,937; V2 LightGBM 70,153; V3 ensemble 70,271; XGBoost 71,837; CatBoost 74,117. The ensemble has the best PR-AUC (0.537) but ties with V2 on cost; the three families' probabilities are on different scales, so the equal-weight average is dominated by the larger-probability models.
+- Implemented baseline and class-weighted Logistic Regression pipelines (`src/failure_model.py`), systematically evaluating class-imbalance strategies (class weights and random oversampling) directly against the competition cost metric.
+- Led deep sensor-level statistical analysis (`src/feature_analysis.py` and `notebooks/eda.ipynb`), quantifying univariate predictive power, missingness-signal relationships, high-correlation sensor clusters (`|rho| > 0.95`), and Kolmogorov–Smirnov / PSI distribution shifts.
+- Identified the test-set sensor misalignment (`s054–s063` shift, `s120` +16.02M offset, and `s047`/`s122` discrepancy) and quantified the ~3x higher failure risk in the test depot using adversarial validation and latent-group analysis.
+- Developed and tuned multi-seed LightGBM and gradient-boosted ensemble models (`src/lightgbm_model.py`, `src/ensemble_model.py`, and `notebooks/lightgbm.ipynb`), establishing seed-noise bounds and informing the Bayes prior-odds / covariate-shift probability calibration used in the final standalone models.
 
 ### Saransh Kumar Gupta (2024508)
 
-- Implemented fit_constant_budget() to calculate a baseline repair budget using the 90.91th percentile of training repair costs, treating missing repair costs as zero.
-- Implemented predict_budgets() to assign the baseline budget to inspected vehicles and zero budget to uninspected vehicles.
-- Added input validation to handle invalid repair costs, inspection flags, and budget values.
+- Implemented the baseline percentile repair-budget estimator (`src/cost_model.py`), modeling conditional repair costs on failed vehicles and enforcing strict input validation for flags, repair costs, and budget allocations.
+- Formulated the Bayes-optimal asymmetric quantile decision rule ($F_C(B^*) = 1 - \frac{1 - L}{p}$ with $L = 0.20 / 0.22 \approx 0.9091$) to balance the 20% under-budget shortfall penalty against the 2% unused-budget penalty and fixed $10 inspection cost.
+- Evaluated nested cross-validation policies (`src/nested_budget_evaluation.py` and `src/evaluation.py`), comparing constant-budget baselines against conditional log-cost distribution modeling.
+- Co-designed the decoupled inspection and budget probability multipliers (`P_FLAG_MULT = 1.25`, `P_BUDG_MULT = 1.60`), upper-tail dollar scaling (`BUDGET_SCALE = 1.25`), outlier budget capping (`$8,500`), and automated submission integrity assertions.
